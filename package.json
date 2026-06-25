@@ -1,0 +1,46 @@
+{
+  "name": "Esad",
+  "version": "1.0.0",
+  "main": "backend/server.js",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "dev": "nodemon backend/server.js",
+    "start": "node backend/server.js",
+    "build": "npm install && npm install --prefix frontend && npm run build --prefix frontend"
+  },
+  "keywords": [],
+  "author": "",
+  "type": "module",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.913.0",
+    "@aws-sdk/s3-request-presigner": "^3.913.0",
+    "bcryptjs": "^3.0.2",
+    "compression": "^1.8.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "csurf": "^1.11.0",
+    "dotenv": "^17.2.3",
+    "exceljs": "^4.4.0",
+    "expo-server-sdk": "^4.0.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "express-validator": "^7.2.1",
+    "helmet": "^8.1.0",
+    "hpp": "^0.2.3",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.0",
+    "nodemailer": "^7.0.11",
+    "pdfkit": "^0.17.2",
+    "pg": "^8.14.1",
+    "pg-escape": "^0.2.0",
+    "sharp": "^0.34.2",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
