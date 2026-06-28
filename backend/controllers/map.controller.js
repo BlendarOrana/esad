@@ -1,16 +1,16 @@
 import { promisePool } from "../lib/db.js";
-import { uploadToS3 } from "../lib/s3.js"; // Based on your lib file
+import { uploadToS3 } from "../lib/s3.js";
 
 export const createMap = async (req, res) => {
     try {
         const { projectId } = req.params;
         const { name, map_type } = req.body;
-        // canvas_json_data could come as a JSON string payload from form-data if uploading
-        const canvas_json_data = req.body.canvas_json_data ? JSON.parse(req.body.canvas_json_data) : null; 
+        
+        const canvas_json_data = req.body.canvas_json_data ? JSON.parse(req.body.canvas_json_data) : null;
 
-        // Validate
-        if (!['UPLOAD', 'CANVAS'].includes(map_type)) {
-            return res.status(400).json({ error: "map_type must be UPLOAD or CANVAS" });
+        // Validate Map Type
+        if (!['UPLOAD', 'CANVAS', 'REPORT'].includes(map_type)) {
+            return res.status(400).json({ error: "map_type must be UPLOAD, CANVAS, or REPORT" });
         }
 
         let background_image_url = null;
@@ -21,13 +21,15 @@ export const createMap = async (req, res) => {
 
             const s3Result = await uploadToS3(
                 req.file.buffer, 
-                `maps/project-${projectId}`, // S3 Key Base path
+                `maps/project-${projectId}`, 
                 req.file.originalname, 
                 req.file.mimetype,
-                true // Process via Sharp
+                true 
             );
             background_image_url = s3Result.CloudFrontUrl || s3Result.Location;
         }
+
+        // If 'REPORT', we don't need S3 background images or Canvas data. It just inserts name and type.
 
         const result = await promisePool.query(
             `INSERT INTO maps (project_id, name, map_type, background_image_url, canvas_json_data) 
@@ -56,7 +58,6 @@ export const getMaps = async (req, res) => {
 
 export const updateMapCanvas = async (req, res) => {
     try {
-        // Just for Canvas map updating JSON block after they drag more elements
         const { canvas_json_data } = req.body;
         const result = await promisePool.query(
             `UPDATE maps SET canvas_json_data = $1 WHERE id = $2 RETURNING *`,
@@ -70,9 +71,8 @@ export const updateMapCanvas = async (req, res) => {
 
 export const deleteMap = async (req, res) => {
     try {
-        // Automatically cascades deletes for pins & photos
         await promisePool.query(`DELETE FROM maps WHERE id = $1`, [req.params.mapId]);
-        res.json({ message: "Floor Map deleted successfully" });
+        res.json({ message: "Floor Map/Tab deleted successfully" });
     } catch (err) {
         res.status(500).json({ error: "Internal server error" });
     }

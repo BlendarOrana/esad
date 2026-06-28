@@ -9,7 +9,6 @@ export const uploadPhotosToPin = async (req, res) => {
 
         const { pinId } = req.params;
 
-        // Use the existing multi-upload block provided in s3.js
         const uploadResult = await uploadMultipleImages(
             req.files, 
             `projects/pins/${pinId}`
@@ -22,8 +21,9 @@ export const uploadPhotosToPin = async (req, res) => {
         // Generate database insert entries for all successful photos
         const dbPromises = uploadResult.successful.map(img => {
             return promisePool.query(
+                // Saving the KEY instead of the full URL here
                 `INSERT INTO photos (pin_id, image_url) VALUES ($1, $2) RETURNING *`,
-                [pinId, img.url] // Either CloudFrontUrl or s3 location based on your code
+                [pinId, img.key] 
             );
         });
 
@@ -44,12 +44,31 @@ export const uploadPhotosToPin = async (req, res) => {
 
 export const deletePhoto = async (req, res) => {
     try {
-        // Option to pull URL from DB to extract object KEY, then delete from S3 (If desired)
-        // await deleteFromS3('projects/pins/...');
+        const { photoId } = req.params;
 
-        await promisePool.query(`DELETE FROM photos WHERE id = $1`, [req.params.photoId]);
-        res.json({ message: "Photo deleted" });
+        // 1. Get the S3 key from the database first
+        const photoRes = await promisePool.query(
+            `SELECT image_url FROM photos WHERE id = $1`, 
+            [photoId]
+        );
+
+        if (photoRes.rows.length === 0) {
+            return res.status(404).json({ error: "Photo not found" });
+        }
+
+        const s3Key = photoRes.rows[0].image_url; // Assuming this holds the key now
+
+        // 2. Delete the actual file from S3
+        if (s3Key) {
+            await deleteFromS3(s3Key);
+        }
+
+        // 3. Delete the record from the database
+        await promisePool.query(`DELETE FROM photos WHERE id = $1`, [photoId]);
+        
+        res.json({ message: "Photo deleted successfully" });
     } catch (err) {
+        console.error("Delete photo err:", err);
         res.status(500).json({ error: "Internal server error" });
     }
 };

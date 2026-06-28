@@ -22,22 +22,18 @@ const generateAccessToken = (userId) => {
 // ── LOGIN ──────────────────────────────────────────────
 export const login = async (req, res) => {
   const { name, password } = req.body;
-
   if (!name || !password) {
     return res.status(400).json({ message: "Name and password are required" });
   }
-
   try {
     const result = await promisePool.query(
       'SELECT * FROM users WHERE name = $1',
       [name]
     );
     const user = result.rows[0];
-
     if (!user) {
       return res.status(400).json({ message: "Invalid name or password" });
     }
-
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(400).json({ message: "Invalid name or password" });
@@ -45,19 +41,21 @@ export const login = async (req, res) => {
 
     const accessToken = generateAccessToken(user.id);
 
+    // Cookie for web clients
     res.cookie("accessToken", accessToken, {
       ...COOKIE_OPTIONS,
-      maxAge: ACCESS_TOKEN_EXPIRY_SECONDS * 1000,
+      maxAge: ACCESS_TOKEN_EXPIRY_SECONDS ,
     });
 
-    return res.json({ _id: user.id, name: user.name });
-
-  } catch (error) {
-    console.error("Login error:", error.message);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-
+    // Token in body for mobile clients (AsyncStorage can't read httpOnly cookies)
+    return res.json({ _id: user.id, name: user.name, token: accessToken });
+} catch (error) {
+  console.error("LOGIN FULL ERROR:", error); // 👈 IMPORTANT
+  return res.status(500).json({
+    message: error.message,
+    stack: error.stack,
+  });
+}};
 // ── LOGOUT ────────────────────────────────────────────
 export const logout = (req, res) => {
   try {

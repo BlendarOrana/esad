@@ -60,14 +60,22 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
 // ---------------- CORS ----------------
-const allowedOrigin = process.env.CLIENT_URL || "http://localhost:5173";
+const allowedOrigins = [
+  process.env.CLIENT_URL || "http://localhost:5173",
+];
+
 app.use(
   cors({
-    origin: allowedOrigin,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (React Native mobile app, curl, etc.)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
-console.log("CORS is allowing requests from:", allowedOrigin);
+console.log("CORS is allowing requests from:", allowedOrigins);
 
 // ---------------- CSRF ----------------
 app.get("/api/csrf-token", (req, res) => {
@@ -82,6 +90,18 @@ app.get("/api/csrf-token", (req, res) => {
 });
 
 const validateCsrf = (req, res, next) => {
+  // Skip CSRF for mobile app (uses Bearer tokens, immune to CSRF by design)
+  const clientType = req.headers["x-client-type"];
+  if (clientType === "mobile") {
+    return next();
+  }
+
+  // Skip CSRF for Bearer token requests (authenticated mobile calls)
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return next();
+  }
+
   if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
     const headerToken = req.headers["csrf-token"];
     const cookieToken = req.cookies["csrf-token"];
@@ -129,7 +149,7 @@ app.use((err, req, res, next) => {
 });
 
 // ---------------- START SERVER ----------------
-app.listen(PORT, async () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`Server running on http://localhost:${PORT}`);
   await connectDB();
 });
