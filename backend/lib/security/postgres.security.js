@@ -150,7 +150,6 @@ export const executeQuery = async (query, params = []) => {
   try {
     // Log query in development (but not the actual parameters for security)
     if (process.env.NODE_ENV === 'development') {
-      console.log('Executing query:', query.replace(/\$\d+/g, '?'));
     }
     
     const result = await client.query(query, params);

@@ -72,3 +72,45 @@ export const getMe = (req, res) => {
   const { id, name } = req.user;
   res.json({ _id: id, name });
 };
+
+
+ // Add this function to auth.controller.js, alongside login/logout/getMe.
+// It reuses generateAccessToken and COOKIE_OPTIONS already defined in that file.
+
+// ── REGISTER ───────────────────────────────────────────
+export const register = async (req, res) => {
+  const { name, password } = req.body;
+  if (!name || !password) {
+    return res.status(400).json({ message: "Name and password are required" });
+  }
+  if (password.length < 3) {
+    return res.status(400).json({ message: "Password must be at least 6 characters" });
+  }
+  try {
+    const existing = await promisePool.query(
+      'SELECT id FROM users WHERE name = $1',
+      [name]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ message: "That name is already taken" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const result = await promisePool.query(
+      'INSERT INTO users (name, password) VALUES ($1, $2) RETURNING id, name',
+      [name, hashedPassword]
+    );
+    const user = result.rows[0];
+
+    const accessToken = generateAccessToken(user.id);
+    res.cookie("accessToken", accessToken, {
+      ...COOKIE_OPTIONS,
+      maxAge: ACCESS_TOKEN_EXPIRY_SECONDS,
+    });
+
+    return res.status(201).json({ _id: user.id, name: user.name, token: accessToken });
+  } catch (error) {
+    console.error("REGISTER ERROR:", error);
+    return res.status(500).json({ message: error.message });
+  }
+};

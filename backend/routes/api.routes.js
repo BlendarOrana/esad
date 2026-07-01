@@ -17,11 +17,13 @@ const router = express.Router();
 router.post('/auth/login', authCtrl.login);
 router.post('/auth/logout', protectRoute, authCtrl.logout);
 router.get('/auth/me', protectRoute, authCtrl.getMe);
+router.post('/auth/register', protectRoute, authCtrl.register);
 
 // ============ SHARE & REPORTS (UNPROTECTED) ============ 
 router.get('/share/:token/client-view', shareCtrl.getClientView);
 
 // ALL FOLLOWING ROUTES EXPECT JWT:
+router.use(protectRoute);
 
 // ============ PROJECTS ============ 
 router.get('/projects', projectCtrl.getProjects);
@@ -50,6 +52,5 @@ router.delete('/photos/:photoId', mediaCtrl.deletePhoto);
 // ============ CLIENT REPORTS / SHARING ============ 
 router.get('/client/:projectId/magic-link', clientController.getMagicLinkToken);
 router.get('/client/:projectId/pdf', clientController.generateReportPdf);
-router.get('/client/:projectId/word', clientController.generateReportWord);
 
 export default router;

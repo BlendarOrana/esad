@@ -124,7 +124,6 @@ export const deleteFromS3 = async (filePathInS3) => {
             Bucket: process.env.AWS_BUCKET_NAME,
             Key: filePathInS3,
         }));
-        console.log(`Deleted from S3: ${filePathInS3}`);
         return true;
     } catch (err) {
         console.error(`S3 Delete Error: ${err.message}`);

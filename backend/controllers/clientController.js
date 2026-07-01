@@ -1,68 +1,36 @@
 import { promisePool } from '../lib/db.js';
 import puppeteer from 'puppeteer';
 import fetch from 'node-fetch';
-import { 
-    Document, 
-    Packer, 
-    Paragraph, 
-    TextRun, 
-    HeadingLevel, 
-    ImageRun, 
-    Table, 
-    TableRow, 
-    TableCell, 
-    BorderStyle, 
-    WidthType, 
-    AlignmentType,
-    ShadingType
-} from 'docx';
-import { getSignedImageUrl } from '../lib/s3.js';
+import { getSignedImageUrl } from "../lib/s3.js";
 
-// --- HELPERS ---
-
-/**
- * Downloads an image from a URL and returns a Buffer.
- * Essential for embedding images in Word documents.
- */
-async function getImageBuffer(url) {
+// Helper: Convert S3 URL to Base64 string
+async function getBase64Image(url) {
     try {
         const response = await fetch(url);
-        if (!response.ok) return null;
-        const arrayBuffer = await response.arrayBuffer();
-        return Buffer.from(arrayBuffer);
+        if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
+        const buffer = await response.arrayBuffer();
+        const contentType = response.headers.get('content-type');
+        return `data:${contentType};base64,${Buffer.from(buffer).toString('base64')}`;
     } catch (e) {
-        console.error("Download Error:", e);
-        return null;
+        console.error("Image Fetch Error:", e);
+        return null; // Return null so the PDF still generates without this image
     }
 }
 
-/**
- * Common Severity Styles for consistency between PDF and Word
- */
-const SEVERITY_SETTINGS = {
-    URGENT: { color: 'D00000', label: 'URGENT' },
-    MODERATE: { color: 'FF8C00', label: 'MODERATE' },
-    MINOR: { color: 'E1B000', label: 'MINOR' },
-    DEFAULT: { color: '000000', label: 'INFO' }
-};
-
-const getSeverity = (sev) => SEVERITY_SETTINGS[sev?.toUpperCase()] || SEVERITY_SETTINGS.DEFAULT;
-
-/**
- * Data Fetching Logic
- */
-const fetchCompiledProjectData = async (identifier) => {
+const fetchCompiledProjectData = async (projectId) => {
+    // 1. Get Project AND Engineer Name
     const projResult = await promisePool.query(
         `SELECT p.*, u.name as engineer_name 
          FROM projects p 
          JOIN users u ON p.user_id = u.id 
          WHERE p.id = $1`, 
-        [identifier]
+        [projectId]
     );
 
     if (projResult.rowCount === 0) return null;
     const project = projResult.rows[0];
 
+    // 2. Get Maps
     const mapsResult = await promisePool.query(
         `SELECT * FROM maps WHERE project_id = $1 ORDER BY created_at ASC`, 
         [project.id]
@@ -80,12 +48,14 @@ const fetchCompiledProjectData = async (identifier) => {
                 [pin.id]
             );
 
-            const photos = await Promise.all(photosReq.rows.map(async (ph) => {
+            // 3. CONVERT IMAGES TO BASE64 (The Fix)
+            const photosWithBase64 = await Promise.all(photosReq.rows.map(async (ph) => {
                 const signedUrl = await getSignedImageUrl(ph.image_url);
-                return { ...ph, signed_url: signedUrl };
+                const base64Data = await getBase64Image(signedUrl);
+                return { ...ph, base64: base64Data };
             }));
 
-            return { ...pin, photos };
+            return { ...pin, photos: photosWithBase64 };
         }));
         return { ...map, pins };
     }));
@@ -93,191 +63,102 @@ const fetchCompiledProjectData = async (identifier) => {
     return { project, maps };
 };
 
-// --- PDF GENERATION ---
 export const generateReportPdf = async (req, res) => {
+    let browser;
     try {
-        const data = await fetchCompiledProjectData(req.params.projectId);
+        const { projectId } = req.params;
+
+        const data = await fetchCompiledProjectData(projectId);
         if (!data) return res.status(404).json({ error: "Project missing" });
+
+        const getSeverityStyle = (severity) => {
+            switch (severity?.toUpperCase()) {
+                case 'URGENT': return { color: '#d00000', label: 'URGENT' };
+                case 'MODERATE': return { color: '#ff8c00', label: 'MODERATE' };
+                case 'MINOR': return { color: '#e1b000', label: 'MINOR' };
+                default: return { color: '#000000', label: 'INFO' };
+            }
+        };
 
         const htmlContent = `
             <html>
                 <head>
                     <style>
-                        body { font-family: 'Helvetica', Arial, sans-serif; padding: 40px; color: #000; }
-                        .header { border-bottom: 5px solid #000; padding-bottom: 20px; margin-bottom: 40px; }
-                        .brand { font-weight: bold; font-size: 14px; text-transform: uppercase; color: #666; }
-                        .title { font-size: 32px; font-weight: 800; text-transform: uppercase; margin: 5px 0; }
-                        .engineer-badge { background: #000; color: #fff; padding: 4px 10px; display: inline-block; font-weight: bold; margin-top: 10px; }
-                        
-                        .floor-title { font-size: 20px; font-weight: bold; border-bottom: 2px solid #000; margin: 40px 0 20px; text-transform: uppercase; }
-                        
-                        .pin-card { border: 1px solid #ddd; margin-bottom: 30px; page-break-inside: avoid; }
-                        .pin-header { background: #f9f9f9; padding: 10px 15px; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; }
-                        .severity { font-weight: bold; }
+                        body { font-family: 'Helvetica', Arial, sans-serif; padding: 30px; color: #333; }
+                        .header { border-bottom: 4px solid #000; padding-bottom: 15px; margin-bottom: 30px; }
+                        .project-title { font-size: 28px; font-weight: bold; text-transform: uppercase; margin: 0; }
+                        .engineer-name { background: #000; color: #fff; padding: 2px 8px; font-weight: bold; }
+                        .floor-block { margin-top: 30px; page-break-before: auto; }
+                        .floor-title { font-size: 18px; font-weight: 700; border-bottom: 1px solid #000; margin-bottom: 15px; }
+                        .pin-card { border: 1px solid #ddd; margin-bottom: 20px; page-break-inside: avoid; border-radius: 8px; overflow: hidden; }
+                        .pin-header { background: #f5f5f5; padding: 10px; font-weight: bold; }
                         .pin-body { padding: 15px; }
-                        .photo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 15px; }
-                        .photo-grid img { width: 100%; height: 250px; object-fit: cover; border: 1px solid #000; }
+                        .photo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+                        .photo-grid img { width: 100%; height: 200px; object-fit: cover; border-radius: 4px; }
                     </style>
                 </head>
                 <body>
                     <div class="header">
-                        <div class="brand">Swiss Safety Centre • Protocol</div>
-                        <div class="title">${data.project.title}</div>
-                        <div>${data.project.address || ''}</div>
-                        <div class="engineer-badge">Inspected by: ${data.project.engineer_name}</div>
+                        <div style="font-size: 10px; letter-spacing: 1px;">SWISS SAFETY CENTRE</div>
+                        <h1 class="project-title">${data.project.title || 'Untitled Project'}</h1>
+                        <p>${data.project.address || 'No Address Provided'}</p>
+                        <div>Engineer: <span class="engineer-name">${data.project.engineer_name || 'N/A'}</span></div>
                     </div>
+
                     ${data.maps.map(floor => `
-                        <div class="floor-title">${floor.name}</div>
-                        ${floor.pins.map(pin => {
-                            const sev = getSeverity(pin.severity);
-                            return `
-                                <div class="pin-card">
-                                    <div class="pin-header">
-                                        <span style="color: #${sev.color}">⚠ ${sev.label} ISSUE</span>
-                                        <span style="color: #888">ID: #${pin.id}</span>
-                                    </div>
-                                    <div class="pin-body">
-                                        <p>${pin.text_note}</p>
-                                        <div class="photo-grid">
-                                            ${pin.photos.map(ph => `<img src="${ph.signed_url}" />`).join('')}
+                        <div class="floor-block">
+                            <div class="floor-title">AREA: ${floor.name}</div>
+                            ${floor.pins.length === 0 ? '<p>No pins in this area.</p>' : floor.pins.map(pin => {
+                                const style = getSeverityStyle(pin.severity);
+                                return `
+                                    <div class="pin-card">
+                                        <div class="pin-header">
+                                            <span style="color: ${style.color}">${style.label} ISSUE</span>
+                                        </div>
+                                        <div class="pin-body">
+                                            <p>${pin.text_note || 'No notes provided.'}</p>
+                                            <div class="photo-grid">
+                                                ${pin.photos.map(ph => ph.base64 ? `<img src="${ph.base64}" />` : '').join('')}
+                                            </div>
                                         </div>
                                     </div>
-                                </div>
-                            `;
-                        }).join('')}
+                                `;
+                            }).join('')}
+                        </div>
                     `).join('')}
                 </body>
             </html>`;
 
-        const browser = await puppeteer.launch({ headless: "new", args: ['--no-sandbox'] });
+        // Launch browser with more stable settings
+        browser = await puppeteer.launch({ 
+            headless: "new", 
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null, // Useful for Docker
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage', // Prevents crashes in low-memory environments
+            ] 
+        });
+        
         const page = await browser.newPage();
-        await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
-        const pdf = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '20px', bottom: '20px' } });
+        await page.setContent(htmlContent, { waitUntil: 'networkidle2' });
+        
+        const pdf = await page.pdf({ 
+            format: 'A4', 
+            printBackground: true,
+            margin: { top: '40px', bottom: '40px', left: '20px', right: '20px' } 
+        });
+        
         await browser.close();
 
         res.contentType("application/pdf");
         res.send(pdf);
+
     } catch (err) {
-        res.status(500).send("PDF Error");
-    }
-};
-
-// --- WORD GENERATION ---
-export const generateReportWord = async (req, res) => {
-    try {
-        const data = await fetchCompiledProjectData(req.params.projectId);
-        if (!data) return res.status(404).send("Project missing");
-
-        const children = [];
-
-        // 1. Header Logic
-        children.push(new Paragraph({
-            children: [new TextRun({ text: "SWISS SAFETY CENTRE • PROTOCOL", size: 20, bold: true, color: "666666" })]
-        }));
-        children.push(new Paragraph({
-            heading: HeadingLevel.HEADING_1,
-            children: [new TextRun({ text: data.project.title.toUpperCase(), size: 56, bold: true })]
-        }));
-        children.push(new Paragraph({
-            children: [
-                new TextRun({ text: " INSPECTED BY: ", size: 20 }),
-                new TextRun({ text: ` ${data.project.engineer_name} `, size: 20, bold: true, color: "FFFFFF", shading: { fill: "000000" } }),
-            ],
-            spacing: { after: 400 }
-        }));
-
-        // 2. Map & Pin Logic
-        for (const floor of data.maps) {
-            children.push(new Paragraph({
-                text: floor.name.toUpperCase(),
-                heading: HeadingLevel.HEADING_2,
-                border: { bottom: { color: "000000", space: 1, value: BorderStyle.SINGLE, size: 12 } },
-                spacing: { before: 400, after: 200 }
-            }));
-
-            for (const pin of floor.pins) {
-                const sev = getSeverity(pin.severity);
-
-                // Build "Card" with Table
-                const pinTable = new Table({
-                    width: { size: 100, type: WidthType.PERCENTAGE },
-                    rows: [
-                        new TableRow({
-                            children: [
-                                new TableCell({
-                                    shading: { fill: "F2F2F2" },
-                                    children: [new Paragraph({
-                                        children: [
-                                            new TextRun({ text: `⚠ ${sev.label} ISSUE`, color: sev.color, bold: true }),
-                                            new TextRun({ text: `    ID: #${pin.id}`, color: "888888", size: 18 })
-                                        ]
-                                    })]
-                                })
-                            ]
-                        }),
-                        new TableRow({
-                            children: [
-                                new TableCell({
-                                    margins: { top: 200, bottom: 200, left: 100, right: 100 },
-                                    children: [new Paragraph({ text: pin.text_note })]
-                                })
-                            ]
-                        })
-                    ]
-                });
-                children.push(pinTable);
-
-                // 3. Image Grid Logic for Word
-                if (pin.photos.length > 0) {
-                    const rowCells = [];
-                    for (const ph of pin.photos) {
-                        const buffer = await getImageBuffer(ph.signed_url);
-                        if (buffer) {
-                            rowCells.push(new TableCell({
-                                children: [
-                                    new Paragraph({
-                                        alignment: AlignmentType.CENTER,
-                                        children: [
-                                            new ImageRun({
-                                                data: buffer,
-                                                transformation: { width: 300, height: 220 }
-                                            })
-                                        ]
-                                    })
-                                ],
-                                border: {
-                                    top: { style: BorderStyle.SINGLE, size: 1 },
-                                    bottom: { style: BorderStyle.SINGLE, size: 1 },
-                                    left: { style: BorderStyle.SINGLE, size: 1 },
-                                    right: { style: BorderStyle.SINGLE, size: 1 },
-                                }
-                            }));
-                        }
-                    }
-
-                    // Arrange into 2 columns
-                    for (let i = 0; i < rowCells.length; i += 2) {
-                        const cells = [rowCells[i]];
-                        cells.push(rowCells[i+1] ? rowCells[i+1] : new TableCell({ children: [] }));
-                        children.push(new Table({
-                            width: { size: 100, type: WidthType.PERCENTAGE },
-                            rows: [new TableRow({ children: cells })]
-                        }));
-                    }
-                }
-                children.push(new Paragraph({ text: "", spacing: { after: 300 } })); // Spacer
-            }
-        }
-
-        const doc = new Document({ sections: [{ children }] });
-        const buffer = await Packer.toBuffer(doc);
-        
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-        res.setHeader('Content-Disposition', `attachment; filename=Report-${data.project.id}.docx`);
-        res.send(buffer);
-    } catch (err) {
-        console.error(err);
-        res.status(500).send("Word Generation Failed");
+        if (browser) await browser.close();
+        // CRITICAL: Look at your terminal when this happens!
+        console.error("PDF GENERATION ERROR DETAILS:", err);
+        res.status(500).json({ error: "Failed to generate PDF", details: err.message });
     }
 };
 
