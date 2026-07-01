@@ -1,22 +1,47 @@
 import { promisePool } from '../lib/db.js';
 import PDFDocument from 'pdfkit';
 import fetch from 'node-fetch';
+import sharp from 'sharp';
 import { getSignedImageUrl } from "../lib/s3.js";
 
-// Helper: Convert S3 URL to Buffer for PDFKit
+// Helper: Fetch an S3 image and return a JPEG Buffer.
+// pdfkit can ONLY embed JPEG and PNG - anything else (WEBP, HEIC/HEIF from
+// iPhones, GIF, TIFF, etc.) throws "Unknown image format". We normalize
+// every image to JPEG here (smaller than PNG for photos) so the source
+// format never matters downstream.
 async function getImageBuffer(url) {
     try {
         const response = await fetch(url);
-        if (!response.ok) throw new Error(`Failed to fetch image`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch image (${response.status} ${response.statusText}) from ${url}`);
+        }
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.startsWith('image/')) {
+            console.warn(`Image Fetch Warning: unexpected content-type "${contentType}" for ${url}`);
+        }
         const arrayBuffer = await response.arrayBuffer();
-        return Buffer.from(arrayBuffer);
+        const rawBuffer = Buffer.from(arrayBuffer);
+        if (rawBuffer.length === 0) {
+            throw new Error(`Empty buffer returned for ${url}`);
+        }
+
+        // Normalize to JPEG regardless of source format (webp/heic/gif/etc).
+        // .flatten() fills any transparency with white before JPEG encoding,
+        // since JPEG has no alpha channel. .rotate() applies EXIF orientation.
+        const jpegBuffer = await sharp(rawBuffer)
+            .rotate()
+            .flatten({ background: '#ffffff' })
+            .jpeg({ quality: 85 })
+            .toBuffer();
+        return jpegBuffer;
     } catch (e) {
-        console.error("Image Fetch Error:", e);
-        return null; 
+        console.error("Image Fetch/Convert Error:", e.message);
+        return null; // Return null so the PDF still generates without this image
     }
 }
 
 const fetchCompiledProjectData = async (projectId) => {
+    // 1. Get Project AND Engineer Name
     const projResult = await promisePool.query(
         `SELECT p.*, u.name as engineer_name 
          FROM projects p 
@@ -28,6 +53,7 @@ const fetchCompiledProjectData = async (projectId) => {
     if (projResult.rowCount === 0) return null;
     const project = projResult.rows[0];
 
+    // 2. Get Maps
     const mapsResult = await promisePool.query(
         `SELECT * FROM maps WHERE project_id = $1 ORDER BY created_at ASC`, 
         [project.id]
@@ -45,6 +71,7 @@ const fetchCompiledProjectData = async (projectId) => {
                 [pin.id]
             );
 
+            // 3. CONVERT IMAGES TO BUFFERS (The Fix)
             const photosWithBuffers = await Promise.all(photosReq.rows.map(async (ph) => {
                 const signedUrl = await getSignedImageUrl(ph.image_url);
                 const buffer = await getImageBuffer(signedUrl);
@@ -59,130 +86,199 @@ const fetchCompiledProjectData = async (projectId) => {
     return { project, maps };
 };
 
+const getSeverityStyle = (severity) => {
+    switch (severity?.toUpperCase()) {
+        case 'URGENT': return { color: '#d00000', label: 'URGENT' };
+        case 'MODERATE': return { color: '#ff8c00', label: 'MODERATE' };
+        case 'MINOR': return { color: '#e1b000', label: 'MINOR' };
+        default: return { color: '#000000', label: 'INFO' };
+    }
+};
+
+// Layout constants (mirrors the CSS in the puppeteer version)
+const PAGE_MARGIN = { top: 40, bottom: 40, left: 20, right: 20 };
+const PIN_HEADER_H = 26;
+const PIN_PADDING = 15;
+const PHOTO_GAP = 10;
+const PHOTO_H = 140;
+const PHOTO_COLS = 2;
+
 export const generateReportPdf = async (req, res) => {
     try {
         const { projectId } = req.params;
+
         const data = await fetchCompiledProjectData(projectId);
         if (!data) return res.status(404).json({ error: "Project missing" });
 
-        // Initialize PDF Document
-        const doc = new PDFDocument({ size: 'A4', margin: 40 });
+        const doc = new PDFDocument({ size: 'A4', margins: PAGE_MARGIN, bufferPages: true });
 
-        // Stream the PDF directly to the response
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename=report-${projectId}.pdf`);
+        res.contentType("application/pdf");
         doc.pipe(res);
 
-        // --- STYLING HELPERS ---
-        const getSeverityColor = (severity) => {
-            switch (severity?.toUpperCase()) {
-                case 'URGENT': return '#d00000';
-                case 'MODERATE': return '#ff8c00';
-                case 'MINOR': return '#e1b000';
-                default: return '#000000';
+        const contentWidth = doc.page.width - PAGE_MARGIN.left - PAGE_MARGIN.right;
+
+        const ensureSpace = (neededHeight) => {
+            const bottomLimit = doc.page.height - PAGE_MARGIN.bottom;
+            if (doc.y + neededHeight > bottomLimit) {
+                doc.addPage();
             }
         };
 
-        // --- HEADER SECTION ---
-        doc.fontSize(8).fillColor('#333').text('SWISS SAFETY CENTRE', { characterSpacing: 1 });
+        // ---------- HEADER ----------
+        doc
+            .fontSize(10)
+            .fillColor('#333')
+            .text('SWISS SAFETY CENTRE', PAGE_MARGIN.left, doc.y, { characterSpacing: 1 });
+
+        doc
+            .fontSize(28)
+            .fillColor('#000')
+            .font('Helvetica-Bold')
+            .text((data.project.title || 'Untitled Project').toUpperCase(), PAGE_MARGIN.left, doc.y + 4);
+
+        doc
+            .fontSize(11)
+            .font('Helvetica')
+            .fillColor('#333')
+            .text(data.project.address || 'No Address Provided', PAGE_MARGIN.left, doc.y + 4);
+
+        // Engineer name badge (black background, white text)
+        const engineerLabel = `Engineer: `;
+        const engineerName = data.project.engineer_name || 'N/A';
         doc.moveDown(0.5);
-        
-        doc.fontSize(24).fillColor('#000').font('Helvetica-Bold').text(data.project.title?.toUpperCase() || 'UNTITLED PROJECT');
-        doc.fontSize(12).font('Helvetica').text(data.project.address || 'No Address Provided');
-        
-        // Engineer Tag (Black box with white text)
+        const badgeY = doc.y;
+        doc.fontSize(11).font('Helvetica');
+        const labelWidth = doc.widthOfString(engineerLabel);
+        doc.fillColor('#333').text(engineerLabel, PAGE_MARGIN.left, badgeY, { continued: false });
+
+        doc.font('Helvetica-Bold');
+        const nameWidth = doc.widthOfString(engineerName) + 16;
+        const badgeX = PAGE_MARGIN.left + labelWidth;
+        doc.rect(badgeX, badgeY - 2, nameWidth, 18).fill('#000');
+        doc.fillColor('#fff').text(engineerName, badgeX + 8, badgeY, { width: nameWidth - 16 });
+
         doc.moveDown(1);
-        const engineerText = ` ENGINEER: ${data.project.engineer_name || 'N/A'} `;
-        const textWidth = doc.widthOfString(engineerText);
-        const textHeight = 18;
-        doc.rect(doc.x, doc.y, textWidth, textHeight).fill('#000');
-        doc.fillColor('#fff').text(engineerText, doc.x, doc.y + 3);
-        
-        // Header Border Line
-        doc.moveDown(1.5);
-        doc.moveTo(40, doc.y).lineTo(555, doc.y).lineWidth(3).strokeColor('#000').stroke();
-        doc.moveDown(2);
+        doc.fillColor('#000');
 
-        // --- CONTENT SECTION ---
+        // Header bottom border
+        const headerBottomY = doc.y + 5;
+        doc.moveTo(PAGE_MARGIN.left, headerBottomY)
+            .lineTo(doc.page.width - PAGE_MARGIN.right, headerBottomY)
+            .lineWidth(4)
+            .strokeColor('#000')
+            .stroke();
+
+        doc.y = headerBottomY + 25;
+
+        // ---------- FLOORS / MAPS ----------
         for (const floor of data.maps) {
-            // Check if we need a new page for the Area title
-            if (doc.y > 700) doc.addPage();
+            ensureSpace(40);
 
-            doc.fillColor('#000').font('Helvetica-Bold').fontSize(14).text(`AREA: ${floor.name.toUpperCase()}`);
-            doc.moveTo(doc.x, doc.y).lineTo(555, doc.y).lineWidth(0.5).strokeColor('#ccc').stroke();
-            doc.moveDown(1);
+            doc
+                .fontSize(18)
+                .font('Helvetica-Bold')
+                .fillColor('#000')
+                .text(`AREA: ${floor.name}`, PAGE_MARGIN.left, doc.y, { width: contentWidth });
+
+            const floorTitleBottomY = doc.y + 4;
+            doc.moveTo(PAGE_MARGIN.left, floorTitleBottomY)
+                .lineTo(doc.page.width - PAGE_MARGIN.right, floorTitleBottomY)
+                .lineWidth(1)
+                .strokeColor('#000')
+                .stroke();
+
+            doc.y = floorTitleBottomY + 15;
 
             if (floor.pins.length === 0) {
-                doc.fillColor('#666').font('Helvetica').fontSize(10).text('No pins in this area.');
-                doc.moveDown(2);
+                doc.fontSize(11).font('Helvetica').fillColor('#333')
+                    .text('No pins in this area.', PAGE_MARGIN.left, doc.y);
+                doc.moveDown(1);
+                continue;
             }
 
             for (const pin of floor.pins) {
-                const color = getSeverityColor(pin.severity);
-                
-                // Add new page if block won't fit
-                if (doc.y > 650) doc.addPage();
+                const style = getSeverityStyle(pin.severity);
+                const noteText = pin.text_note || 'No notes provided.';
 
-                // Draw Pin Card Header
-                const startY = doc.y;
-                doc.rect(40, startY, 515, 20).fill('#f5f5f5');
-                doc.fillColor(color).font('Helvetica-Bold').fontSize(10).text(`${pin.severity || 'INFO'} ISSUE`, 50, startY + 6);
+                // Estimate card height before drawing, so we can page-break cleanly
+                doc.fontSize(11).font('Helvetica');
+                const noteHeight = doc.heightOfString(noteText, { width: contentWidth - PIN_PADDING * 2 });
 
-                // Draw Pin Card Body
-                doc.fillColor('#333').font('Helvetica').fontSize(11).text(pin.text_note || 'No notes provided.', 50, startY + 30, { width: 495 });
-                
-                doc.moveDown(1);
+                const photoRows = Math.ceil((pin.photos?.length || 0) / PHOTO_COLS);
+                const photosHeight = photoRows > 0 ? photoRows * (PHOTO_H + PHOTO_GAP) : 0;
 
-                // --- PHOTO GRID (2 Columns) ---
+                const cardHeight = PIN_HEADER_H + PIN_PADDING + noteHeight + 10 + photosHeight + PIN_PADDING;
+
+                ensureSpace(cardHeight + 20);
+
+                const cardX = PAGE_MARGIN.left;
+                const cardY = doc.y;
+                const cardWidth = contentWidth;
+
+                // Card border
+                doc.roundedRect(cardX, cardY, cardWidth, cardHeight, 6)
+                    .lineWidth(1)
+                    .strokeColor('#ddd')
+                    .stroke();
+
+                // Card header (grey background)
+                doc.rect(cardX, cardY, cardWidth, PIN_HEADER_H).fill('#f5f5f5');
+                doc.fontSize(11).font('Helvetica-Bold').fillColor(style.color)
+                    .text(`${style.label} ISSUE`, cardX + 10, cardY + 7);
+
+                // Card body
+                let bodyY = cardY + PIN_HEADER_H + PIN_PADDING;
+                doc.fontSize(11).font('Helvetica').fillColor('#333')
+                    .text(noteText, cardX + PIN_PADDING, bodyY, { width: cardWidth - PIN_PADDING * 2 });
+
+                bodyY = bodyY + noteHeight + 10;
+
+                // Photo grid (2 columns)
                 if (pin.photos && pin.photos.length > 0) {
-                    const columnWidth = 245;
-                    const gutter = 10;
-                    let currentX = 50;
-                    let rowMaxHeight = 0;
+                    const gridWidth = cardWidth - PIN_PADDING * 2;
+                    const photoWidth = (gridWidth - PHOTO_GAP) / PHOTO_COLS;
 
-                    for (let i = 0; i < pin.photos.length; i++) {
-                        const photo = pin.photos[i];
-                        if (!photo.buffer) continue;
+                    pin.photos.forEach((ph, idx) => {
+                        const col = idx % PHOTO_COLS;
+                        const row = Math.floor(idx / PHOTO_COLS);
+                        const x = cardX + PIN_PADDING + col * (photoWidth + PHOTO_GAP);
+                        const y = bodyY + row * (PHOTO_H + PHOTO_GAP);
 
-                        // Check for page break inside photos
-                        if (doc.y > 700) {
-                            doc.addPage();
-                            currentX = 50;
+                        if (!ph.buffer) {
+                            console.warn(`Skipping photo id=${ph.id} for pin=${pin.id}: no buffer (see "Image Fetch/Convert Error" above)`);
+                            return;
                         }
 
                         try {
-                            doc.image(photo.buffer, currentX, doc.y, {
-                                fit: [columnWidth, 180],
-                                align: 'center'
+                            // Use `fit` ALONE to constrain + center the image in the box.
+                            // Do NOT also pass width/height - combining them with `fit`
+                            // is what was silently breaking image rendering.
+                            doc.image(ph.buffer, x, y, {
+                                fit: [photoWidth, PHOTO_H],
+                                align: 'center',
+                                valign: 'center'
                             });
-                        } catch (err) {
-                            console.error("PDFKit Image Error", err);
+                        } catch (imgErr) {
+                            console.error(`PDFKit image draw error (photo id=${ph.id}, pin=${pin.id}):`, imgErr.message);
                         }
-
-                        if (i % 2 === 0) {
-                            // Move to second column
-                            currentX += columnWidth + gutter;
-                        } else {
-                            // Move to next row
-                            currentX = 50;
-                            doc.moveDown(11); // Move down roughly the height of the image
-                        }
-                    }
+                    });
                 }
 
-                // Add border around the card (optional)
-                const endY = doc.y;
-                doc.rect(40, startY, 515, (endY - startY) + 10).lineWidth(0.5).strokeColor('#ddd').stroke();
-                doc.moveDown(2);
+                doc.y = cardY + cardHeight + 20;
+                doc.fillColor('#000');
             }
         }
 
-        // Finalize
         doc.end();
 
     } catch (err) {
-        console.error("PDFKIT ERROR:", err);
-        res.status(500).json({ error: "Failed to generate PDF", details: err.message });
+        // CRITICAL: Look at your terminal when this happens!
+        console.error("PDF GENERATION ERROR DETAILS:", err);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Failed to generate PDF", details: err.message });
+        } else {
+            res.end();
+        }
     }
 };
 
