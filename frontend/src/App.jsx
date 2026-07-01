@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { Routes, Route, Navigate } from "react-router-dom";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/Dashboardpage";
-import { useAuthStore } from "./stores/useAuthStore";
+import { useAuthStore } from "./stores/Useauthstore";
 
 function ProtectedRoute({ children }) {
   const { admin } = useAuthStore();
