@@ -62,6 +62,7 @@ app.use(cookieParser());
 // ---------------- CORS ----------------
 const allowedOrigins = [
   process.env.CLIENT_URL || "http://localhost:5173",
+  "https://esadweb.onrender.com",
 ];
 
 app.use(
