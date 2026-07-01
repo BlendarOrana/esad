@@ -1,24 +1,22 @@
 import { promisePool } from '../lib/db.js';
-import puppeteer from 'puppeteer';
+import PDFDocument from 'pdfkit';
 import fetch from 'node-fetch';
 import { getSignedImageUrl } from "../lib/s3.js";
 
-// Helper: Convert S3 URL to Base64 string
-async function getBase64Image(url) {
+// Helper: Convert S3 URL to Buffer for PDFKit
+async function getImageBuffer(url) {
     try {
         const response = await fetch(url);
-        if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
-        const buffer = await response.arrayBuffer();
-        const contentType = response.headers.get('content-type');
-        return `data:${contentType};base64,${Buffer.from(buffer).toString('base64')}`;
+        if (!response.ok) throw new Error(`Failed to fetch image`);
+        const arrayBuffer = await response.arrayBuffer();
+        return Buffer.from(arrayBuffer);
     } catch (e) {
         console.error("Image Fetch Error:", e);
-        return null; // Return null so the PDF still generates without this image
+        return null; 
     }
 }
 
 const fetchCompiledProjectData = async (projectId) => {
-    // 1. Get Project AND Engineer Name
     const projResult = await promisePool.query(
         `SELECT p.*, u.name as engineer_name 
          FROM projects p 
@@ -30,7 +28,6 @@ const fetchCompiledProjectData = async (projectId) => {
     if (projResult.rowCount === 0) return null;
     const project = projResult.rows[0];
 
-    // 2. Get Maps
     const mapsResult = await promisePool.query(
         `SELECT * FROM maps WHERE project_id = $1 ORDER BY created_at ASC`, 
         [project.id]
@@ -48,14 +45,13 @@ const fetchCompiledProjectData = async (projectId) => {
                 [pin.id]
             );
 
-            // 3. CONVERT IMAGES TO BASE64 (The Fix)
-            const photosWithBase64 = await Promise.all(photosReq.rows.map(async (ph) => {
+            const photosWithBuffers = await Promise.all(photosReq.rows.map(async (ph) => {
                 const signedUrl = await getSignedImageUrl(ph.image_url);
-                const base64Data = await getBase64Image(signedUrl);
-                return { ...ph, base64: base64Data };
+                const buffer = await getImageBuffer(signedUrl);
+                return { ...ph, buffer };
             }));
 
-            return { ...pin, photos: photosWithBase64 };
+            return { ...pin, photos: photosWithBuffers };
         }));
         return { ...map, pins };
     }));
@@ -64,100 +60,128 @@ const fetchCompiledProjectData = async (projectId) => {
 };
 
 export const generateReportPdf = async (req, res) => {
-    let browser;
     try {
         const { projectId } = req.params;
-
         const data = await fetchCompiledProjectData(projectId);
         if (!data) return res.status(404).json({ error: "Project missing" });
 
-        const getSeverityStyle = (severity) => {
+        // Initialize PDF Document
+        const doc = new PDFDocument({ size: 'A4', margin: 40 });
+
+        // Stream the PDF directly to the response
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename=report-${projectId}.pdf`);
+        doc.pipe(res);
+
+        // --- STYLING HELPERS ---
+        const getSeverityColor = (severity) => {
             switch (severity?.toUpperCase()) {
-                case 'URGENT': return { color: '#d00000', label: 'URGENT' };
-                case 'MODERATE': return { color: '#ff8c00', label: 'MODERATE' };
-                case 'MINOR': return { color: '#e1b000', label: 'MINOR' };
-                default: return { color: '#000000', label: 'INFO' };
+                case 'URGENT': return '#d00000';
+                case 'MODERATE': return '#ff8c00';
+                case 'MINOR': return '#e1b000';
+                default: return '#000000';
             }
         };
 
-        const htmlContent = `
-            <html>
-                <head>
-                    <style>
-                        body { font-family: 'Helvetica', Arial, sans-serif; padding: 30px; color: #333; }
-                        .header { border-bottom: 4px solid #000; padding-bottom: 15px; margin-bottom: 30px; }
-                        .project-title { font-size: 28px; font-weight: bold; text-transform: uppercase; margin: 0; }
-                        .engineer-name { background: #000; color: #fff; padding: 2px 8px; font-weight: bold; }
-                        .floor-block { margin-top: 30px; page-break-before: auto; }
-                        .floor-title { font-size: 18px; font-weight: 700; border-bottom: 1px solid #000; margin-bottom: 15px; }
-                        .pin-card { border: 1px solid #ddd; margin-bottom: 20px; page-break-inside: avoid; border-radius: 8px; overflow: hidden; }
-                        .pin-header { background: #f5f5f5; padding: 10px; font-weight: bold; }
-                        .pin-body { padding: 15px; }
-                        .photo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-                        .photo-grid img { width: 100%; height: 200px; object-fit: cover; border-radius: 4px; }
-                    </style>
-                </head>
-                <body>
-                    <div class="header">
-                        <div style="font-size: 10px; letter-spacing: 1px;">SWISS SAFETY CENTRE</div>
-                        <h1 class="project-title">${data.project.title || 'Untitled Project'}</h1>
-                        <p>${data.project.address || 'No Address Provided'}</p>
-                        <div>Engineer: <span class="engineer-name">${data.project.engineer_name || 'N/A'}</span></div>
-                    </div>
-
-                    ${data.maps.map(floor => `
-                        <div class="floor-block">
-                            <div class="floor-title">AREA: ${floor.name}</div>
-                            ${floor.pins.length === 0 ? '<p>No pins in this area.</p>' : floor.pins.map(pin => {
-                                const style = getSeverityStyle(pin.severity);
-                                return `
-                                    <div class="pin-card">
-                                        <div class="pin-header">
-                                            <span style="color: ${style.color}">${style.label} ISSUE</span>
-                                        </div>
-                                        <div class="pin-body">
-                                            <p>${pin.text_note || 'No notes provided.'}</p>
-                                            <div class="photo-grid">
-                                                ${pin.photos.map(ph => ph.base64 ? `<img src="${ph.base64}" />` : '').join('')}
-                                            </div>
-                                        </div>
-                                    </div>
-                                `;
-                            }).join('')}
-                        </div>
-                    `).join('')}
-                </body>
-            </html>`;
-
-        // Launch browser with more stable settings
-        browser = await puppeteer.launch({ 
-            headless: "new", 
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null, // Useful for Docker
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', // Prevents crashes in low-memory environments
-            ] 
-        });
+        // --- HEADER SECTION ---
+        doc.fontSize(8).fillColor('#333').text('SWISS SAFETY CENTRE', { characterSpacing: 1 });
+        doc.moveDown(0.5);
         
-        const page = await browser.newPage();
-        await page.setContent(htmlContent, { waitUntil: 'networkidle2' });
+        doc.fontSize(24).fillColor('#000').font('Helvetica-Bold').text(data.project.title?.toUpperCase() || 'UNTITLED PROJECT');
+        doc.fontSize(12).font('Helvetica').text(data.project.address || 'No Address Provided');
         
-        const pdf = await page.pdf({ 
-            format: 'A4', 
-            printBackground: true,
-            margin: { top: '40px', bottom: '40px', left: '20px', right: '20px' } 
-        });
+        // Engineer Tag (Black box with white text)
+        doc.moveDown(1);
+        const engineerText = ` ENGINEER: ${data.project.engineer_name || 'N/A'} `;
+        const textWidth = doc.widthOfString(engineerText);
+        const textHeight = 18;
+        doc.rect(doc.x, doc.y, textWidth, textHeight).fill('#000');
+        doc.fillColor('#fff').text(engineerText, doc.x, doc.y + 3);
         
-        await browser.close();
+        // Header Border Line
+        doc.moveDown(1.5);
+        doc.moveTo(40, doc.y).lineTo(555, doc.y).lineWidth(3).strokeColor('#000').stroke();
+        doc.moveDown(2);
 
-        res.contentType("application/pdf");
-        res.send(pdf);
+        // --- CONTENT SECTION ---
+        for (const floor of data.maps) {
+            // Check if we need a new page for the Area title
+            if (doc.y > 700) doc.addPage();
+
+            doc.fillColor('#000').font('Helvetica-Bold').fontSize(14).text(`AREA: ${floor.name.toUpperCase()}`);
+            doc.moveTo(doc.x, doc.y).lineTo(555, doc.y).lineWidth(0.5).strokeColor('#ccc').stroke();
+            doc.moveDown(1);
+
+            if (floor.pins.length === 0) {
+                doc.fillColor('#666').font('Helvetica').fontSize(10).text('No pins in this area.');
+                doc.moveDown(2);
+            }
+
+            for (const pin of floor.pins) {
+                const color = getSeverityColor(pin.severity);
+                
+                // Add new page if block won't fit
+                if (doc.y > 650) doc.addPage();
+
+                // Draw Pin Card Header
+                const startY = doc.y;
+                doc.rect(40, startY, 515, 20).fill('#f5f5f5');
+                doc.fillColor(color).font('Helvetica-Bold').fontSize(10).text(`${pin.severity || 'INFO'} ISSUE`, 50, startY + 6);
+
+                // Draw Pin Card Body
+                doc.fillColor('#333').font('Helvetica').fontSize(11).text(pin.text_note || 'No notes provided.', 50, startY + 30, { width: 495 });
+                
+                doc.moveDown(1);
+
+                // --- PHOTO GRID (2 Columns) ---
+                if (pin.photos && pin.photos.length > 0) {
+                    const columnWidth = 245;
+                    const gutter = 10;
+                    let currentX = 50;
+                    let rowMaxHeight = 0;
+
+                    for (let i = 0; i < pin.photos.length; i++) {
+                        const photo = pin.photos[i];
+                        if (!photo.buffer) continue;
+
+                        // Check for page break inside photos
+                        if (doc.y > 700) {
+                            doc.addPage();
+                            currentX = 50;
+                        }
+
+                        try {
+                            doc.image(photo.buffer, currentX, doc.y, {
+                                fit: [columnWidth, 180],
+                                align: 'center'
+                            });
+                        } catch (err) {
+                            console.error("PDFKit Image Error", err);
+                        }
+
+                        if (i % 2 === 0) {
+                            // Move to second column
+                            currentX += columnWidth + gutter;
+                        } else {
+                            // Move to next row
+                            currentX = 50;
+                            doc.moveDown(11); // Move down roughly the height of the image
+                        }
+                    }
+                }
+
+                // Add border around the card (optional)
+                const endY = doc.y;
+                doc.rect(40, startY, 515, (endY - startY) + 10).lineWidth(0.5).strokeColor('#ddd').stroke();
+                doc.moveDown(2);
+            }
+        }
+
+        // Finalize
+        doc.end();
 
     } catch (err) {
-        if (browser) await browser.close();
-        // CRITICAL: Look at your terminal when this happens!
-        console.error("PDF GENERATION ERROR DETAILS:", err);
+        console.error("PDFKIT ERROR:", err);
         res.status(500).json({ error: "Failed to generate PDF", details: err.message });
     }
 };
